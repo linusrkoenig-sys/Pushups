@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#0d0d0d">
+<title>Push-up Counter</title>
+<style>
+  * {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+    -webkit-tap-highlight-color: transparent;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  html, body {
+    height: 100%;
+    overflow: hidden;
+    background: #0d0d0d;
+    color: #fff;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    touch-action: manipulation;
+  }
+
+  #tapZone {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+  }
+
+  /* --- Top bar: Timer --- */
+  #topBar {
+    position: fixed;
+    top: 0; left: 0; right: 0;
+    padding: calc(env(safe-area-inset-top) + 12px) 16px 12px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    z-index: 10;
+  }
+  #timer {
+    font-size: 1.4rem;
+    font-variant-numeric: tabular-nums;
+    color: #888;
+    letter-spacing: 1px;
+  }
+  #timer.running { color: #4ade80; }
+
+  #topButtons {
+    display: flex;
+    gap: 8px;
+  }
+  .smallBtn {
+    background: #1e1e1e;
+    border: none;
+    color: #ccc;
+    font-size: 0.85rem;
+    padding: 8px 14px;
+    border-radius: 20px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .smallBtn:active { background: #333; }
+  .smallBtn.accent { color: #4ade80; }
+  .smallBtn.danger { color: #f87171; }
+
+  /* --- Counter --- */
+  #count {
+    font-size: 30vw;
+    font-weight: 800;
+    line-height: 1;
+    font-variant-numeric: tabular-nums;
+    transition: transform 0.06s ease-out;
+  }
+  #count.bump { transform: scale(1.12); }
+
+  #pace {
+    margin-top: 8px;
+    font-size: 1rem;
+    color: #555;
+    font-variant-numeric: tabular-nums;
+    height: 1.2em;
+  }
+
+  /* --- Bottom hint --- */
+  #hint {
+    position: fixed;
+    bottom: calc(env(safe-area-inset-bottom) + 20px);
+    left: 0; right: 0;
+    text-align: center;
+    font-size: 0.85rem;
+    color: #444;
+    pointer-events: none;
+    transition: opacity 0.3s;
+  }
+
+  /* Ripple feedback */
+  #ripple {
+    position: fixed;
+    border-radius: 50%;
+    background: rgba(74, 222, 128, 0.25);
+    pointer-events: none;
+    transform: translate(-50%, -50%) scale(0);
+    animation: rippleAnim 0.4s ease-out forwards;
+    z-index: 5;
+  }
+  @keyframes rippleAnim {
+    to { transform: translate(-50%, -50%) scale(1); opacity: 0; }
+  }
+
+  /* Flash overlay */
+  #flash {
+    position: fixed;
+    inset: 0;
+    background: #4ade80;
+    opacity: 0;
+    pointer-events: none;
+    z-index: 4;
+    transition: opacity 0.15s;
+  }
+  #flash.on { opacity: 0.08; transition: none; }
+</style>
+</head>
+<body>
+
+<div id="tapZone">
+  <div id="count">0</div>
+  <div id="pace"></div>
+</div>
+
+<div id="topBar">
+  <div id="timer">00:00</div>
+  <div id="topButtons">
+    <button class="smallBtn accent" id="startBtn">Start</button>
+    <button class="smallBtn" id="undoBtn">−1</button>
+    <button class="smallBtn danger" id="resetBtn">Reset</button>
+  </div>
+</div>
+
+<div id="hint">Tippe irgendwo, um zu zählen · Start drücken</div>
+
+<div id="flash"></div>
+
+<script>
+(() => {
+  const STORAGE_KEY = 'pushupCounter_v1';
+
+  const countEl  = document.getElementById('count');
+  const paceEl   = document.getElementById('pace');
+  const timerEl  = document.getElementById('timer');
+  const startBtn = document.getElementById('startBtn');
+  const undoBtn  = document.getElementById('undoBtn');
+  const resetBtn = document.getElementById('resetBtn');
+  const hintEl   = document.getElementById('hint');
+  const flashEl  = document.getElementById('flash');
+
+  let count = 0;
+  let running = false;
+  let startTime = 0;       // Date.now() beim (letzten) Start
+  let elapsedBefore = 0;   // ms vor dem aktuellen Lauf
+  let tickInterval = null;
+  let wakeLock = null;
+
+  // ---------- Persistence ----------
+  function save() {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({
+        count,
+        elapsedBefore,
+        running,
+        savedAt: Date.now()
+      }));
+    } catch (e) {}
+  }
+
+  function load() {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return;
+      const s = JSON.parse(raw);
+      count = s.count || 0;
+      elapsedBefore = s.elapsedBefore || 0;
+      // Wenn vorher lief und die App geschlossen wurde: nicht auto-fortsetzen,
+      // aber Zeit bis zum Schließen mitzählen.
+      if (s.running && s.savedAt) {
+        elapsedBefore += Date.now() - s.savedAt;
+      }
+      running = false;
+    } catch (e) {}
+  }
+
+  // ---------- Time helpers ----------
+  function getElapsedMs() {
+    return elapsedBefore + (running ? Date.now() - startTime : 0);
+  }
+
+  function formatTime(ms) {
+    const totalSec = Math.floor(ms / 1000);
+    const m = Math.floor(totalSec / 60);
+    const s = totalSec % 60;
+    return String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
+  }
+
+  function renderTime() {
+    timerEl.textContent = formatTime(getElapsedMs());
+  }
+
+  function renderPace() {
+    const sec = getElapsedMs() / 1000;
+    if (count > 0 && sec > 2) {
+      paceEl.textContent = (sec / count).toFixed(1) + ' s / rep';
+    } else {
+      paceEl.textContent = '';
+    }
+  }
+
+  // ---------- Start / Pause / Reset ----------
+  function start() {
+    if (running) return;
+    running = true;
+    startTime = Date.now();
+    startBtn.textContent = 'Pause';
+    startBtn.classList.remove('accent');
+    timerEl.classList.add('running');
+    hintEl.style.opacity = '0';
+    if (!tickInterval) tickInterval = setInterval(renderTime, 200);
+    requestWakeLock();
+    save();
+  }
+
+  function pause() {
+    if (!running) return;
+    elapsedBefore += Date.now() - startTime;
+    running = false;
+    startBtn.textContent = 'Weiter';
+    startBtn.classList.add('accent');
+    timerEl.classList.remove('running');
+    if (tickInterval) { clearInterval(tickInterval); tickInterval = null; }
+    releaseWakeLock();
+    save();
+    renderTime();
+  }
+
+  function reset() {
+    if (running) pause();
+    count = 0;
+    elapsedBefore = 0;
+    startBtn.textContent = 'Start';
+    startBtn.classList.add('accent');
+    timerEl.classList.remove('running');
+    hintEl.style.opacity = '1';
+    renderCount(false);
+    renderTime();
+    renderPace();
+    save();
+  }
+
+  // ---------- Count ----------
+  function renderCount(bump) {
+    countEl.textContent = count;
+    if (bump) {
+      countEl.classList.remove('bump');
+      // Reflow erzwingen, damit Animation neu startet
+      void countEl.offsetWidth;
+      countEl.classList.add('bump');
+    }
+  }
+
+  function addTap(x, y) {
+    if (!running) return;
+    count++;
+    renderCount(true);
+    renderPace();
+    vibrate(15);
+    spawnRipple(x, y);
+    flash();
+    save();
+  }
+
+  function undo() {
+    if (count <= 0) return;
+    count--;
+    renderCount(false);
+    renderPace();
+    vibrate(10);
+    save();
+  }
+
+  // ---------- Feedback ----------
+  function vibrate(ms) {
+    if (navigator.vibrate) navigator.vibrate(ms);
+  }
+
+  function spawnRipple(x, y) {
+    const r = document.createElement('div');
+    r.id = 'ripple';
+    const size = 180;
+    r.style.width = size + 'px';
+    r.style.height = size + 'px';
+    r.style.left = x + 'px';
+    r.style.top = y + 'px';
+    document.body.appendChild(r);
+    setTimeout(() => r.remove(), 400);
+  }
+
+  let flashTimeout = null;
+  function flash() {
+    flashEl.classList.add('on');
+    clearTimeout(flashTimeout);
+    flashTimeout = setTimeout(() => flashEl.classList.remove('on'), 30);
+  }
+
+  // ---------- Wake Lock ----------
+  async function requestWakeLock() {
+    try {
+      if ('wakeLock' in navigator) {
+        wakeLock = await navigator.wakeLock.request('screen');
+        wakeLock.addEventListener('release', () => { wakeLock = null; });
+      }
+    } catch (e) {}
+  }
+  function releaseWakeLock() {
+    if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && running) requestWakeLock();
+  });
+
+  // ---------- Events ----------
+  // Ganzes Screen = Tap-Zone
+  document.getElementById('tapZone').addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    addTap(e.clientX, e.clientY);
+  });
+
+  // Buttons: kein Bubble zur Tap-Zone
+  function stopBubble(el, fn) {
+    el.addEventListener('pointerdown', (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+      fn(e);
+    });
+  }
+
+  stopBubble(startBtn, () => running ? pause() : start());
+  stopBubble(undoBtn, undo);
+  stopBubble(resetBtn, reset);
+
+  // Doppeltap-Zoom / Kontextmenü verhindern
+  document.addEventListener('dblclick', (e) => e.preventDefault());
+  document.addEventListener('contextmenu', (e) => e.preventDefault());
+  document.addEventListener('gesturestart', (e) => e.preventDefault());
+
+  // ---------- Init ----------
+  load();
+  renderCount(false);
+  renderTime();
+  renderPace();
+  startBtn.textContent = running ? 'Pause' : (elapsedBefore > 0 || count > 0 ? 'Weiter' : 'Start');
+  startBtn.classList.add('accent');
+  if (!running) hintEl.style.opacity = '1';
+
+  // Laufenden Timer nach Reload nicht automatisch starten, aber Zeit anzeigen
+  timerEl.textContent = formatTime(elapsedBefore);
+
+  // Beim Verlassen speichern
+  window.addEventListener('beforeunload', save);
+})();
+</script>
+</body>
+</html>
